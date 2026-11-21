@@ -35,6 +35,8 @@ public:
     bool listDir(const std::string& path, std::vector<DirEntry>& out, std::string& error);
     bool makeDir(const std::string& remote, std::string& error);
     bool rename(const std::string& from, const std::string& to, std::string& error);
+    bool remove(const std::string& remote, bool isDirectory, std::string& error);
+    bool deleteTree(const std::string& remoteDir, std::string& error, size_t* deleted = nullptr);
     bool download(const std::string& remote, const std::string& local, std::string& error,
                   uint64_t* bytes = nullptr, ProgressFn progress = {});
     bool screenshot(const std::string& localPng, std::string& error,

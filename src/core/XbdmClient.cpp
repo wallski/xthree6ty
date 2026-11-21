@@ -407,6 +407,47 @@ bool XbdmClient::rename(const std::string& from, const std::string& to, std::str
     return false;
 }
 
+bool XbdmClient::remove(const std::string& remote, bool isDirectory, std::string& error) {
+    std::string path = remote;
+    // XBDM wants directory deletes without a trailing backslash, plus the DIR flag.
+    while (!path.empty() && path.back() == '\\') path.pop_back();
+    const std::string cmd = "DELETE NAME=\"" + path + "\"" + (isDirectory ? " DIR" : "");
+    const auto lines = command(cmd, error);
+    if (!error.empty()) return false;
+    for (const auto& line : lines) {
+        if (line.rfind("200-", 0) == 0) return true;
+        if (line.rfind("4", 0) == 0) {
+            error = "console rejected DELETE: " + line;
+            return false;
+        }
+    }
+    error = "no response to DELETE";
+    return false;
+}
+
+bool XbdmClient::deleteTree(const std::string& remoteDir, std::string& error, size_t* deleted) {
+    std::string dir = remoteDir;
+    if (!dir.empty() && dir.back() != '\\') dir.push_back('\\');
+
+    std::vector<DirEntry> entries;
+    if (!listDir(dir, entries, error)) return false;
+
+    size_t count = deleted ? *deleted : 0;
+    for (const auto& e : entries) {
+        if (e.isDirectory) {
+            if (!deleteTree(dir + e.name, error, &count)) return false;
+        } else {
+            if (!remove(dir + e.name, false, error)) return false;
+            ++count;
+        }
+    }
+    // Remove the now-empty directory itself.
+    if (!remove(remoteDir, true, error)) return false;
+    ++count;
+    if (deleted) *deleted = count;
+    return true;
+}
+
 bool XbdmClient::download(const std::string& remote, const std::string& local, std::string& error,
                           uint64_t* bytes, ProgressFn progress) {
     const std::string wire = "GETFILE NAME=\"" + remote + "\"\r\n";
@@ -497,18 +538,19 @@ bool XbdmClient::upload(const std::string& local, const std::string& remote, std
         return false;
     }
 
-    const uint32_t size = static_cast<uint32_t>(data.size());
-    const uint8_t header[4] = {
-        static_cast<uint8_t>(size & 0xff),
-        static_cast<uint8_t>((size >> 8) & 0xff),
-        static_cast<uint8_t>((size >> 16) & 0xff),
-        static_cast<uint8_t>((size >> 24) & 0xff),
-    };
-    if (!impl_->sendAll(reinterpret_cast<const char*>(header), 4, error)) return false;
+    // The console does NOT want a length prefix on the data: LENGTH= already
+    // told it how many bytes to expect. (Sending a 4-byte prefix writes those
+    // bytes into the file and leaves 4 stray bytes to corrupt the next command.)
     if (!data.empty() && !impl_->sendAll(reinterpret_cast<const char*>(data.data()), data.size(), error, progress)) return false;
 
-    // The console may send a final status line after accepting the payload.
-    impl_->drainTrailingStatus();
+    // The console replies with a final status once the payload is written. Read
+    // it so it cannot desync the next command on a reused connection.
+    std::string status;
+    if (!impl_->nextLine(status, error, 10)) return false;
+    if (!status.empty() && status[0] == '4') {
+        error = "console rejected SENDFILE: " + status;
+        return false;
+    }
     if (bytes) *bytes = data.size();
     return true;
 }

@@ -316,8 +316,12 @@ struct ExplorerState {
 
     bool openNewFolder = false;
     bool openRename = false;
+    bool openDelete = false;
     char nameBuf[128]{};
     std::string renameRemote;
+    std::string deleteRemote;
+    std::string deleteName;
+    bool deleteIsDir = false;
 };
 
 struct TransferState {
@@ -873,6 +877,38 @@ void explorerRename(UiState& s, const std::string& ip, const std::string& oldRem
     });
 }
 
+void explorerDelete(UiState& s, const std::string& ip, const std::string& remote,
+                    const std::string& name, bool isDir) {
+    s.explorer.status = "Deleting " + name + "...";
+    s.jobs.submit("explorer_delete", [&s, ip, remote, name, isDir] {
+        JobResult r;
+        r.id = "explorer_delete";
+        std::string err;
+        XbdmClient client;
+        if (!client.connect(ip, 730, err)) {
+            r.text = "Delete failed: " + err;
+            return r;
+        }
+        bool ok = false;
+        size_t removed = 0;
+        if (isDir) {
+            ok = client.deleteTree(remote, err, &removed);
+        } else {
+            ok = client.remove(remote, false, err);
+            removed = 1;
+        }
+        if (!ok) {
+            r.text = "Delete failed: " + err;
+            return r;
+        }
+        r.text = "Deleted " + name + (isDir && removed > 1
+                                          ? " (" + std::to_string(removed - 1) + " files)"
+                                          : "");
+        r.refresh = true;
+        return r;
+    });
+}
+
 void captureScreenshot(UiState& s, const std::string& ip) {
     char stamp[64]{};
     const std::time_t now = std::time(nullptr);
@@ -1187,6 +1223,13 @@ void drawExplorerTab(UiState& s, const std::string& ip) {
                 ex.openNewFolder = true;
             }
             ImGui::Separator();
+            if (ImGui::MenuItem("Delete")) {
+                ex.deleteRemote = ex.path + e.name;
+                ex.deleteName = e.name;
+                ex.deleteIsDir = e.isDirectory;
+                ex.openDelete = true;
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Copy path")) {
                 const std::string full = ex.path + e.name;
                 ::OpenClipboard(nullptr);
@@ -1234,6 +1277,10 @@ void drawExplorerTab(UiState& s, const std::string& ip) {
         ex.openRename = false;
         ImGui::OpenPopup("Rename");
     }
+    if (ex.openDelete) {
+        ex.openDelete = false;
+        ImGui::OpenPopup("Delete");
+    }
     if (ImGui::BeginPopupModal("New folder", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted("Create a folder in:");
         ImGui::TextDisabled("%s", ex.path.c_str());
@@ -1271,6 +1318,27 @@ void drawExplorerTab(UiState& s, const std::string& ip) {
         }
         ImGui::EndPopup();
     }
+    if (ImGui::BeginPopupModal("Delete", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(ex.deleteIsDir ? "Delete this folder and everything inside it?"
+                                              : "Delete this file?");
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f), "%s", ex.deleteName.c_str());
+        ImGui::TextDisabled("This cannot be undone.");
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.62f, 0.18f, 0.16f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.74f, 0.22f, 0.20f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.52f, 0.13f, 0.11f, 1.0f));
+        const bool doDelete = ImGui::Button("Delete", ImVec2(96, 0));
+        ImGui::PopStyleColor(3);
+        ImGui::SameLine();
+        const bool cancel = ImGui::Button("Cancel", ImVec2(96, 0));
+        if (doDelete) {
+            explorerDelete(s, ip, ex.deleteRemote, ex.deleteName, ex.deleteIsDir);
+            ImGui::CloseCurrentPopup();
+        } else if (cancel) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 
     ImGui::Separator();
     if (!ex.error.empty()) {
@@ -1285,8 +1353,7 @@ void drawExplorerTab(UiState& s, const std::string& ip) {
         }
         ImGui::TextDisabled("%s", status.c_str());
     }
-    const std::string busy = s.jobs.busyId();
-    if (busy == "explorer_list" || busy == "explorer_dl" || busy == "explorer_upload") {
+    if (s.jobs.busy()) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.40f, 0.84f, 0.45f, 1.0f), "     working...");
     }
@@ -1495,7 +1562,8 @@ void drawHelpWindow(UiState& s) {
 
     sectionTitle("FILE EXPLORER TAB");
     ImGui::BulletText("Double-click a folder to open it; double-click a file to download it");
-    ImGui::BulletText("Right-click a file or folder to download it to your Downloads folder");
+    ImGui::BulletText("Right-click an item: Open, Download, Rename, New folder, Delete, Copy path");
+    ImGui::BulletText("Right-click empty space: New folder or Refresh");
     ImGui::BulletText("Drag files or folders from Windows into the Explorer to upload them");
     ImGui::BulletText("Screenshot - captures the console framebuffer to a PNG in Downloads");
     ImGui::BulletText("Back, Up, Refresh and breadcrumb buttons navigate instantly from the cache");
@@ -1506,6 +1574,11 @@ void drawHelpWindow(UiState& s) {
     ImGui::BulletText("DRIVELIST - list mounted drives");
     ImGui::BulletText("DIRLIST NAME=\"Hdd1:\\\" - list a directory");
     ImGui::BulletText("GETFILE NAME=\"Hdd1:\\file.bin\" - download a file (binary response)");
+    ImGui::BulletText("SENDFILE NAME=\"Hdd1:\\file.bin\" LENGTH=0x<size> - upload raw bytes");
+    ImGui::BulletText("MKDIR NAME=\"Hdd1:\\folder\" - create a folder");
+    ImGui::BulletText("RENAME NAME=\"old\" NEWNAME=\"new\" - rename a file or folder");
+    ImGui::BulletText("DELETE NAME=\"Hdd1:\\file.bin\" - delete a file");
+    ImGui::BulletText("DELETE NAME=\"Hdd1:\\folder\" DIR - delete an empty folder");
     ImGui::BulletText("XBEINFO RUNNING - currently running title");
     ImGui::BulletText("REBOOT - reboot the console");
 
@@ -1555,7 +1628,8 @@ void drawUi(UiState& s) {
             }
         } else if (result.id == "explorer_dl" || result.id == "explorer_upload") {
             s.explorer.status = result.text;
-        } else if (result.id == "explorer_mkdir" || result.id == "explorer_rename") {
+        } else if (result.id == "explorer_mkdir" || result.id == "explorer_rename" ||
+                   result.id == "explorer_delete") {
             s.explorer.status = result.text;
             if (result.refresh) {
                 // Re-list the current folder so the new/renamed item shows up,
