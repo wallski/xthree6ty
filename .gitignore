@@ -399,3 +399,9 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# X360 Toolkit runtime state
+imgui.ini
+
+# Local XDK documentation dump (not needed to build)
+xdk-reference/
