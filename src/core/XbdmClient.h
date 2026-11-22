@@ -18,6 +18,20 @@ struct DirEntry {
     uint32_t changeLo = 0;
 };
 
+// One entry from the MODULES command.
+struct ModuleInfo {
+    std::string name;
+    uint32_t base = 0;
+    uint32_t size = 0;
+};
+
+// One entry from the WALKMEM command: a mapped virtual-address range.
+struct MemRegion {
+    uint32_t base = 0;
+    uint32_t size = 0;
+    uint32_t protect = 0;
+};
+
 class XbdmClient {
 public:
     XbdmClient();
@@ -46,6 +60,24 @@ public:
                       ProgressFn progress = {});
     bool upload(const std::string& local, const std::string& remote, std::string& error,
                 uint64_t* bytes = nullptr, ProgressFn progress = {});
+
+    // Fetch only the first `maxBytes` of a remote file. This build of XBDM has
+    // no ranged GETFILE, so the file is streamed and the transfer is stopped
+    // once enough has arrived; the underlying connection is closed afterwards
+    // and this client is not reusable. Used to read XEX headers without pulling
+    // multi-gigabyte game files.
+    bool readFilePrefix(const std::string& remote, size_t maxBytes, std::vector<uint8_t>& out,
+                        std::string& error);
+
+    // Read/write target memory. Reads use GETMEMEX (raw binary); writes use
+    // SETMEM (hex payload, 128 bytes per command, as the console requires).
+    bool getMemory(uint32_t address, uint32_t length, std::vector<uint8_t>& out,
+                   std::string& error);
+    bool setMemory(uint32_t address, const std::vector<uint8_t>& data, std::string& error);
+
+    // Target introspection, used by the trainer to pick scan ranges.
+    bool listModules(std::vector<ModuleInfo>& out, std::string& error);
+    bool listMemoryRegions(std::vector<MemRegion>& out, std::string& error);
 
 private:
     struct Impl;

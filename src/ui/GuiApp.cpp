@@ -16,14 +16,19 @@
 #include <d3d11.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <queue>
@@ -31,6 +36,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -62,12 +68,170 @@ constexpr float kCardGap = 12.0f;
 
 enum class Screen { Home, Console, Tools };
 enum class Tool { Xuiz, Xex, Nand };
-enum class ConsoleTab { Console, Explorer };
+enum class ConsoleTab { Console, Explorer, Trainer };
 enum class ViewMode { Icons, Details };
 
 struct SavedConsole {
     std::string name;
     std::string ip;
+};
+
+// ---------- trainer ----------
+
+// A candidate address found by the memory scanner. `bits` / `number` /
+// `display` describe the value read by the scan that produced this row, and the
+// `prev*` copies keep the value from the scan before it so Changed / Increased /
+// Decreased can compare two reads.
+struct MemCandidate {
+    uint32_t address = 0;
+    uint64_t bits = 0;
+    double number = 0.0;
+    std::string display;
+    uint64_t prevBits = 0;
+    double prevNumber = 0.0;
+    bool hasPrev = false;
+    bool selected = false;
+};
+
+// One row in the address list: an address the user follows, with an optional
+// value that is rewritten continuously while Freeze is ticked.
+struct PinnedEntry {
+    uint32_t address = 0;
+    int type = 2;
+    uint64_t bits = 0;
+    double number = 0.0;
+    std::string valueText;
+    std::vector<uint8_t> bytes;
+    bool freeze = false;
+    char edit[64] = "";
+};
+
+struct FreezeTarget {
+    uint32_t address = 0;
+    std::vector<uint8_t> data;
+};
+
+// Re-writes every frozen address on a timer, on its own XBDM connection so it
+// cannot interfere with the scanning connection.
+struct FreezeState {
+    std::thread worker;
+    mutable std::mutex mutex;
+    std::atomic<bool> stop{false};
+    std::string ip;
+    std::vector<FreezeTarget> targets;
+
+    void ensureStarted() {
+        if (!worker.joinable()) {
+            stop.store(false);
+            worker = std::thread([this] { run(); });
+        }
+    }
+    void setTargets(const std::string& targetIp, std::vector<FreezeTarget> list) {
+        ensureStarted();
+        std::lock_guard<std::mutex> lock(mutex);
+        ip = targetIp;
+        targets = std::move(list);
+    }
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        targets.clear();
+    }
+    size_t count() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return targets.size();
+    }
+
+    void run() {
+        XbdmClient client;
+        std::string connectedIp;
+        while (!stop.load()) {
+            std::string targetIp;
+            std::vector<FreezeTarget> list;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                targetIp = ip;
+                list = targets;
+            }
+            if (!list.empty() && !targetIp.empty()) {
+                if (!client.connected() || connectedIp != targetIp) {
+                    client.close();
+                    std::string err;
+                    connectedIp = client.connect(targetIp, 730, err) ? targetIp : std::string();
+                }
+                if (client.connected()) {
+                    for (const auto& t : list) {
+                        std::string err;
+                        if (!client.setMemory(t.address, t.data, err)) {
+                            client.close();
+                            connectedIp.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < 5 && !stop.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        client.close();
+    }
+
+    ~FreezeState() {
+        stop.store(true);
+        if (worker.joinable()) worker.join();
+    }
+};
+
+// Everything the Trainer tab keeps: scan setup, results, the pinned address list
+// and the memory viewer.
+struct TrainerState {
+    std::string target;
+    std::vector<ModuleInfo> modules;
+    std::vector<MemRegion> regions;
+    bool refreshed = false;
+
+    // Scanner setup.
+    char startHex[32] = "82000000";
+    char lengthHex[32] = "00800000";
+    int valueType = 2; // index into kMemTypeNames (Int32)
+    char value[64] = "100";
+    char value2[64] = "0"; // upper bound for a Between first scan
+    char delta[64] = "1";  // step for Increased by / Decreased by
+    int firstMode = 0;     // index into kScanFirstNames
+    int nextType = 0;      // index into kScanNextNames
+
+    std::vector<MemCandidate> candidates;
+    std::atomic<uint32_t> scannedBytes{0};
+    std::atomic<uint32_t> totalBytes{0};
+    std::atomic<int> liveMatches{0};
+    bool hasScan = false;
+    bool scanning = false;
+    int selected = -1;
+    std::string status;
+    std::string error;
+    char writeValue[64] = "";
+
+    // Address list.
+    std::vector<PinnedEntry> pins;
+    char pinAddr[16] = "";
+    std::string pinStatus;
+    bool freezeDirty = false;
+    std::string freezeIp;
+
+    // Memory viewer.
+    char viewerAddr[16] = "82000000";
+    uint32_t viewerBase = 0x82000000;
+    std::vector<uint8_t> viewerBytes;
+    bool viewerLoaded = false;
+    bool viewerReading = false;
+    bool viewerTried = false;
+    int viewerSelected = -1;
+    char viewerWriteAddr[16] = "";
+    char viewerWriteHex[128] = "";
+    std::string viewerStatus;
+
+    int subTab = 0;
+    FreezeState freeze;
 };
 
 // ---------- OLE drag-out support ----------
@@ -209,6 +373,14 @@ struct JobResult {
     std::string path;
     bool hasEntries = false;
     bool refresh = false;
+
+    std::vector<MemCandidate> candidates;
+    bool hasCandidates = false;
+    std::vector<ModuleInfo> modules;
+    std::vector<MemRegion> regions;
+    std::vector<uint8_t> memBytes;
+    uint32_t memBase = 0;
+    bool hasMem = false;
 };
 
 struct Job {
@@ -364,9 +536,12 @@ struct UiState {
     bool done = false;
     int selected = -1;
 
-    JobRunner jobs;
     TransferState transfer;
     ExplorerState explorer;
+    TrainerState trainer;
+    // Declared after the job-scoped state so its worker threads are joined
+    // (in ~JobRunner) before that state is torn down.
+    JobRunner jobs;
 
     std::vector<SavedConsole> consoles;
     char newName[64]{};
@@ -494,6 +669,11 @@ void runTextJob(UiState& s, const std::string& id, const std::string& module, st
 
 std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+std::string upper(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     return s;
 }
 
@@ -1466,6 +1646,1169 @@ void drawConsoleTab(UiState& s, const std::string& ip) {
     ImGui::EndChild();
 }
 
+// ---------- trainer ----------
+
+enum MemTypeId {
+    kMemI8 = 0,
+    kMemI16,
+    kMemI32,
+    kMemI64,
+    kMemU8,
+    kMemU16,
+    kMemU32,
+    kMemU64,
+    kMemF32,
+    kMemF64,
+};
+
+const char* const kMemTypeNames[] = {"Int8", "Int16", "Int32", "Int64", "UInt8",
+                                     "UInt16", "UInt32", "UInt64", "Float", "Double"};
+
+// First-scan (and next-scan) predicates. A first scan walks the whole mapped
+// range; a next scan re-reads the surviving addresses and filters them again.
+enum FirstScanId { kFirstExact = 0, kFirstUnknown, kFirstBigger, kFirstSmaller, kFirstBetween };
+enum NextScanId {
+    kNextExact = 0,
+    kNextBigger,
+    kNextSmaller,
+    kNextBetween,
+    kNextIncreased,
+    kNextDecreased,
+    kNextIncreasedBy,
+    kNextDecreasedBy,
+    kNextChanged,
+    kNextUnchanged
+};
+
+const char* const kScanFirstNames[] = {"Exact", "Unknown", "Bigger", "Smaller", "Between"};
+const char* const kScanNextNames[] = {"Exact",      "Bigger",    "Smaller",     "Between",
+                                      "Increased",  "Decreased", "Increased by", "Decreased by",
+                                      "Changed",    "Unchanged"};
+
+int memTypeSize(int t) {
+    switch (t) {
+    case kMemI8:
+    case kMemU8: return 1;
+    case kMemI16:
+    case kMemU16: return 2;
+    case kMemI32:
+    case kMemU32:
+    case kMemF32: return 4;
+    case kMemI64:
+    case kMemU64:
+    case kMemF64: return 8;
+    default: return 4;
+    }
+}
+
+bool memTypeIsSigned(int t) {
+    return t == kMemI8 || t == kMemI16 || t == kMemI32 || t == kMemI64;
+}
+
+double memNumber(int t, const uint8_t* p) {
+    switch (t) {
+    case kMemI8: return static_cast<int8_t>(p[0]);
+    case kMemU8: return p[0];
+    case kMemI16: { int16_t v; std::memcpy(&v, p, 2); return v; }
+    case kMemU16: { uint16_t v; std::memcpy(&v, p, 2); return v; }
+    case kMemI32: { int32_t v; std::memcpy(&v, p, 4); return v; }
+    case kMemU32: { uint32_t v; std::memcpy(&v, p, 4); return v; }
+    case kMemI64: { int64_t v; std::memcpy(&v, p, 8); return static_cast<double>(v); }
+    case kMemU64: { uint64_t v; std::memcpy(&v, p, 8); return static_cast<double>(v); }
+    case kMemF32: { float v; std::memcpy(&v, p, 4); return v; }
+    case kMemF64: { double v; std::memcpy(&v, p, 8); return v; }
+    default: return 0.0;
+    }
+}
+
+std::string memDisplay(int t, const uint8_t* p) {
+    char buf[64]{};
+    if (t == kMemF32 || t == kMemF64) std::snprintf(buf, sizeof(buf), "%.6g", memNumber(t, p));
+    else if (t == kMemU64) std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(memNumber(t, p)));
+    else if (t == kMemI64) std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(memNumber(t, p)));
+    else std::snprintf(buf, sizeof(buf), "%g", memNumber(t, p));
+    return buf;
+}
+
+bool parseHexU32(const char* text, uint32_t& out) {
+    if (!text || !*text) return false;
+    std::string s(text);
+    size_t i = 0;
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+    if (s.compare(i, 2, "0x") == 0 || s.compare(i, 2, "0X") == 0) i += 2;
+    if (i >= s.size()) return false;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(s.c_str() + i, &end, 16);
+    if (end == s.c_str() + i) return false;
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+
+bool parseScanValue(int t, const std::string& text, std::vector<uint8_t>& bytes, double& number) {
+    std::string s = text;
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+    if (s.empty()) return false;
+
+    const size_t n = static_cast<size_t>(memTypeSize(t));
+    bytes.assign(n, 0);
+
+    if (t == kMemF32) {
+        const float f = static_cast<float>(std::strtod(s.c_str(), nullptr));
+        std::memcpy(bytes.data(), &f, 4);
+        number = f;
+        return true;
+    }
+    if (t == kMemF64) {
+        const double d = std::strtod(s.c_str(), nullptr);
+        std::memcpy(bytes.data(), &d, 8);
+        number = d;
+        return true;
+    }
+
+    const bool neg = !s.empty() && s[0] == '-';
+    const char* p = s.c_str() + (neg ? 1 : 0);
+    int base = 10;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
+    const unsigned long long mag = std::strtoull(p, nullptr, base);
+
+    if (memTypeIsSigned(t)) {
+        const long long sv = neg ? -static_cast<long long>(mag) : static_cast<long long>(mag);
+        const unsigned long long uv = static_cast<unsigned long long>(sv);
+        for (size_t i = 0; i < n; ++i) bytes[i] = static_cast<uint8_t>((uv >> (8 * i)) & 0xff);
+        number = static_cast<double>(sv);
+    } else {
+        for (size_t i = 0; i < n; ++i) bytes[i] = static_cast<uint8_t>((mag >> (8 * i)) & 0xff);
+        number = static_cast<double>(mag);
+    }
+    return true;
+}
+
+// Walks every mapped byte in [start, start+length), reading it in chunks. For
+// each chunk the callback gets the chunk address, a buffer that may extend a
+// few bytes past `newLen` (so values straddling a chunk boundary are still
+// visible), the buffer size, and `newLen`. Returning false stops the walk.
+void forEachMappedChunk(const std::vector<MemRegion>& regions, uint32_t start, uint32_t length,
+                        size_t overlap, XbdmClient& client, std::string& error, bool& aborted,
+                        const std::function<bool(uint32_t, const uint8_t*, size_t, size_t)>& fn) {
+    aborted = false;
+    if (length == 0) return;
+
+    struct Range { uint32_t base; uint32_t size; };
+    std::vector<Range> ranges;
+    const uint64_t windowEnd = static_cast<uint64_t>(start) + length;
+    if (regions.empty()) {
+        ranges.push_back({start, length});
+    } else {
+        for (const auto& r : regions) {
+            const uint64_t rb = r.base;
+            const uint64_t re = static_cast<uint64_t>(r.base) + r.size;
+            const uint64_t a = std::max<uint64_t>(rb, start);
+            const uint64_t b = std::min<uint64_t>(re, windowEnd);
+            if (b > a) ranges.push_back({static_cast<uint32_t>(a), static_cast<uint32_t>(b - a)});
+        }
+    }
+
+    constexpr uint32_t kChunk = 0x40000;
+    for (const auto& rg : ranges) {
+        uint32_t off = 0;
+        while (off < rg.size) {
+            const uint32_t newLen = std::min<uint32_t>(kChunk, rg.size - off);
+            const uint32_t extra =
+                std::min<uint32_t>(static_cast<uint32_t>(overlap), rg.size - off - newLen);
+            std::vector<uint8_t> data;
+            const uint32_t addr = rg.base + off;
+            if (!client.getMemory(addr, newLen + extra, data, error)) {
+                aborted = true;
+                return;
+            }
+            if (data.size() < newLen) {
+                error = "short memory read";
+                aborted = true;
+                return;
+            }
+            if (!fn(addr, data.data(), data.size(), newLen)) return;
+            off += newLen;
+        }
+    }
+}
+
+// Total bytes of mapped memory that a scan of [start, start+length) will read;
+// used for the progress bar.
+uint32_t mappedBytesInWindow(const std::vector<MemRegion>& regions, uint32_t start, uint32_t length) {
+    if (length == 0) return 0;
+    const uint64_t windowEnd = static_cast<uint64_t>(start) + length;
+    if (regions.empty()) return length;
+    uint64_t total = 0;
+    for (const auto& r : regions) {
+        const uint64_t a = std::max<uint64_t>(r.base, start);
+        const uint64_t b = std::min<uint64_t>(static_cast<uint64_t>(r.base) + r.size, windowEnd);
+        if (b > a) total += (b - a);
+    }
+    return total > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(total);
+}
+
+void trainerRefreshTarget(UiState& s, const std::string& ip) {
+    s.trainer.status = "Reading target...";
+    s.trainer.error.clear();
+    s.jobs.submit("trainer_refresh", [&s, ip] {
+        JobResult r;
+        r.id = "trainer_refresh";
+        XbdmClient client;
+        std::string err;
+        if (!client.connect(ip, 730, err)) {
+            r.text = "Trainer: " + err;
+            return r;
+        }
+        std::string name;
+        const auto info = client.command("XBEINFO RUNNING", err);
+        for (const auto& line : info) {
+            const auto at = line.find("name=\"");
+            if (at == std::string::npos) continue;
+            const auto end = line.find('"', at + 6);
+            if (end != std::string::npos) {
+                name = line.substr(at + 6, end - (at + 6));
+                break;
+            }
+        }
+        r.path = name;
+        std::vector<ModuleInfo> mods;
+        std::string modErr;
+        client.listModules(mods, modErr);
+        std::vector<MemRegion> regs;
+        std::string regErr;
+        client.listMemoryRegions(regs, regErr);
+        client.close();
+        r.modules = std::move(mods);
+        r.regions = std::move(regs);
+        return r;
+    });
+}
+
+// Little-endian bytes -> uint64, used for exact bit compares.
+uint64_t readBits(const uint8_t* p, size_t n) {
+    uint64_t bits = 0;
+    for (size_t i = 0; i < n && i < 8; ++i) bits |= static_cast<uint64_t>(p[i]) << (8 * i);
+    return bits;
+}
+
+std::vector<uint8_t> bytesFromBits(uint64_t bits, int type) {
+    const size_t n = static_cast<size_t>(memTypeSize(type));
+    std::vector<uint8_t> bytes(n, 0);
+    for (size_t i = 0; i < n; ++i) bytes[i] = static_cast<uint8_t>((bits >> (8 * i)) & 0xff);
+    return bytes;
+}
+
+std::string displayFromBits(int type, uint64_t bits) {
+    const std::vector<uint8_t> bytes = bytesFromBits(bits, type);
+    return memDisplay(type, bytes.data());
+}
+
+std::string hex8(uint32_t v) {
+    char buf[16]{};
+    std::snprintf(buf, sizeof(buf), "%08X", v);
+    return buf;
+}
+
+// Reads whitespace/comma separated hex bytes ("90 90 12" or "909012").
+bool parseHexBytes(const std::string& text, std::vector<uint8_t>& out) {
+    out.clear();
+    int hi = -1;
+    for (char ch : text) {
+        int v;
+        if (ch >= '0' && ch <= '9') v = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') v = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'F') v = ch - 'A' + 10;
+        else continue;
+        if (hi < 0) hi = v;
+        else { out.push_back(static_cast<uint8_t>((hi << 4) | v)); hi = -1; }
+    }
+    return hi < 0 && !out.empty();
+}
+
+// Result rows the user is acting on: every ticked row, or the single highlighted
+// row when nothing is ticked.
+std::vector<size_t> trainerChosen(const TrainerState& tr) {
+    std::vector<size_t> out;
+    for (size_t i = 0; i < tr.candidates.size(); ++i)
+        if (tr.candidates[i].selected) out.push_back(i);
+    if (out.empty() && tr.selected >= 0 && static_cast<size_t>(tr.selected) < tr.candidates.size())
+        out.push_back(static_cast<size_t>(tr.selected));
+    return out;
+}
+
+// First scan: walks the whole mapped range and keeps addresses that satisfy the
+// chosen predicate. "Unknown" keeps every addressed value so it can be narrowed
+// afterwards (the usual way to find a health bar).
+void trainerFirstScan(UiState& s, const std::string& ip, int mode) {
+    if (s.trainer.scanning) return;
+    uint32_t start = 0;
+    uint32_t length = 0;
+    if (!parseHexU32(s.trainer.startHex, start) || !parseHexU32(s.trainer.lengthHex, length)) {
+        s.trainer.error = "Start and Length must be hex values.";
+        return;
+    }
+    if (length == 0) {
+        s.trainer.error = "Length must be greater than zero.";
+        return;
+    }
+    const int type = s.trainer.valueType;
+    s.trainer.firstMode = mode;
+
+    std::vector<uint8_t> needle;
+    double lo = 0.0;
+    double hi = 0.0;
+    if (mode != kFirstUnknown) {
+        if (!parseScanValue(type, s.trainer.value, needle, lo)) {
+            s.trainer.error = "Enter a value to scan for.";
+            return;
+        }
+        if (mode == kFirstBetween) {
+            std::vector<uint8_t> n2;
+            if (!parseScanValue(type, s.trainer.value2, n2, hi)) {
+                s.trainer.error = "Enter the upper bound for the Between scan.";
+                return;
+            }
+        }
+    }
+    const uint64_t needleBits = needle.empty() ? 0 : readBits(needle.data(), needle.size());
+    const std::vector<MemRegion> regions = s.trainer.regions;
+
+    s.trainer.scanning = true;
+    s.trainer.error.clear();
+    s.trainer.status = (mode == kFirstUnknown) ? "Snapshotting memory..." : "Scanning...";
+    s.trainer.scannedBytes.store(0);
+    s.trainer.liveMatches.store(0);
+    s.trainer.totalBytes.store(mappedBytesInWindow(regions, start, length));
+    s.jobs.submit("trainer_scan", [&s, ip, start, length, type, needleBits, lo, hi, mode, regions] {
+        JobResult r;
+        r.id = "trainer_scan";
+        XbdmClient client;
+        std::string err;
+        if (!client.connect(ip, 730, err)) {
+            r.text = "Trainer: " + err;
+            return r;
+        }
+        const size_t tsize = static_cast<size_t>(memTypeSize(type));
+        const size_t step = (mode == kFirstUnknown) ? (tsize ? tsize : 1) : 1;
+        const size_t cap = (mode == kFirstUnknown) ? 3000000u : 1000000u;
+        std::vector<MemCandidate> out;
+        if (mode == kFirstUnknown) {
+            const uint64_t est = mappedBytesInWindow(regions, start, length) / step;
+            out.reserve(static_cast<size_t>(std::min<uint64_t>(est + 16, cap)));
+        } else {
+            out.reserve(1u << 16);
+        }
+        bool truncated = false;
+        bool aborted = false;
+        forEachMappedChunk(regions, start, length, tsize ? tsize - 1 : 0, client, err, aborted,
+                           [&](uint32_t base, const uint8_t* data, size_t dataSize, size_t newLen) {
+                               s.trainer.scannedBytes.fetch_add(static_cast<uint32_t>(newLen));
+                               for (size_t o = 0; o + tsize <= dataSize && o < newLen; o += step) {
+                                   const uint8_t* p = data + o;
+                                   const uint64_t bits = readBits(p, tsize);
+                                   const double num = memNumber(type, p);
+                                   bool keep = false;
+                                   switch (mode) {
+                                   case kFirstUnknown: keep = true; break;
+                                   case kFirstExact: keep = bits == needleBits; break;
+                                   case kFirstBigger: keep = num > lo; break;
+                                   case kFirstSmaller: keep = num < lo; break;
+                                   case kFirstBetween: keep = num >= lo && num <= hi; break;
+                                   }
+                                   if (!keep) continue;
+                                   if (out.size() >= cap) { truncated = true; return false; }
+                                   MemCandidate c;
+                                   c.address = base + static_cast<uint32_t>(o);
+                                   c.bits = bits;
+                                   c.number = num;
+                                   c.display = memDisplay(type, p);
+                                   out.push_back(std::move(c));
+                                   s.trainer.liveMatches.fetch_add(1);
+                               }
+                               return true;
+                           });
+        client.close();
+        if (aborted) {
+            r.text = "Scan stopped: " + err;
+            return r;
+        }
+        char msg[160]{};
+        if (mode == kFirstUnknown) {
+            std::snprintf(msg, sizeof(msg),
+                          "%zu snapshot(s)%s. Change the value in game, then pick Decreased or Changed and press Next scan.",
+                          out.size(), truncated ? " (cap reached - narrow the range)" : "");
+        } else {
+            std::snprintf(msg, sizeof(msg), "%zu match(es)%s.", out.size(),
+                          truncated ? " (cap reached - narrow the range)" : "");
+        }
+        r.text = msg;
+        r.candidates = std::move(out);
+        r.hasCandidates = true;
+        return r;
+    });
+}
+
+// Next scan: re-reads the surviving addresses and keeps those that match the
+// chosen predicate against the value captured by the previous scan.
+void trainerNextScan(UiState& s, const std::string& ip) {
+    if (s.trainer.scanning) return;
+    if (!s.trainer.hasScan || s.trainer.candidates.empty()) {
+        s.trainer.error = "Run a first scan before a next scan.";
+        return;
+    }
+    const int type = s.trainer.valueType;
+    const int mode = s.trainer.nextType;
+    std::vector<uint8_t> needle;
+    double lo = 0.0;
+    double hi = 0.0;
+    double delta = 0.0;
+
+    const bool needsValue =
+        mode == kNextExact || mode == kNextBigger || mode == kNextSmaller || mode == kNextBetween;
+    if (needsValue) {
+        if (!parseScanValue(type, s.trainer.value, needle, lo)) {
+            s.trainer.error = "Enter a value to compare against.";
+            return;
+        }
+        if (mode == kNextBetween) {
+            std::vector<uint8_t> n2;
+            if (!parseScanValue(type, s.trainer.value2, n2, hi)) {
+                s.trainer.error = "Enter the upper bound for the Between scan.";
+                return;
+            }
+        }
+    }
+    if (mode == kNextIncreasedBy || mode == kNextDecreasedBy) {
+        const std::string d = s.trainer.delta;
+        if (d.empty()) {
+            s.trainer.error = "Enter the step for the Increased by / Decreased by scan.";
+            return;
+        }
+        delta = std::strtod(d.c_str(), nullptr);
+    }
+    const uint64_t needleBits = needle.empty() ? 0 : readBits(needle.data(), needle.size());
+    const std::vector<MemRegion> regions = s.trainer.regions;
+
+    // A lightweight snapshot of the surviving rows: the scan job only needs the
+    // address and the previous value, so this avoids copying thousands of value
+    // strings while the job runs.
+    struct CandsLite {
+        uint32_t address;
+        uint64_t bits;
+        double number;
+    };
+    std::vector<CandsLite> cands;
+    cands.reserve(s.trainer.candidates.size());
+    for (const auto& c : s.trainer.candidates) cands.push_back({c.address, c.bits, c.number});
+
+    s.trainer.scanning = true;
+    s.trainer.error.clear();
+    s.trainer.status = "Filtering...";
+    s.trainer.scannedBytes.store(0);
+    s.trainer.liveMatches.store(0);
+    {
+        const size_t tsize = static_cast<size_t>(memTypeSize(type));
+        uint32_t mn = cands.front().address;
+        uint32_t mx = cands.front().address;
+        for (const auto& c : cands) {
+            mn = std::min(mn, c.address);
+            mx = std::max(mx, c.address);
+        }
+        s.trainer.totalBytes.store(mappedBytesInWindow(
+            regions, mn, static_cast<uint32_t>(static_cast<uint64_t>(mx) + tsize - mn)));
+    }
+    s.jobs.submit("trainer_narrow",
+                  [&s, ip, type, mode, needleBits, lo, hi, delta, regions, cands = std::move(cands)]() mutable {
+                      JobResult r;
+                      r.id = "trainer_narrow";
+                      XbdmClient client;
+                      std::string err;
+                      if (!client.connect(ip, 730, err)) {
+                          r.text = "Trainer: " + err;
+                          return r;
+                      }
+                      std::sort(cands.begin(), cands.end(),
+                                [](const CandsLite& a, const CandsLite& b) {
+                                    return a.address < b.address;
+                                });
+                      const size_t tsize = static_cast<size_t>(memTypeSize(type));
+                      const size_t cap = 3000000u;
+                      std::vector<MemCandidate> out;
+                      size_t idx = 0;
+                      bool aborted = false;
+                      bool truncated = false;
+
+                      // Read only windows that actually hold candidates. As the
+                      // result set thins out this avoids re-reading megabytes of
+                      // memory that cannot match.
+                      constexpr uint32_t kChunk = 0x40000;
+                      auto regionEndFor = [&regions](uint32_t addr) -> uint64_t {
+                          if (regions.empty()) return static_cast<uint64_t>(addr) + 0x40000;
+                          for (const auto& rg : regions) {
+                              const uint64_t b = rg.base;
+                              const uint64_t e = b + rg.size;
+                              if (addr >= b && addr < e) return e;
+                          }
+                          return 0;
+                      };
+
+                      while (idx < cands.size()) {
+                          if (out.size() >= cap) { truncated = true; break; }
+                          const uint32_t start = cands[idx].address;
+                          const uint64_t regionEnd = regionEndFor(start);
+                          if (regionEnd <= start) { ++idx; continue; }
+                          const uint32_t len = static_cast<uint32_t>(
+                              std::min<uint64_t>(kChunk, regionEnd - start));
+                          if (len < tsize) { ++idx; continue; }
+                          const uint32_t extra = static_cast<uint32_t>(
+                              std::min<uint64_t>(tsize - 1, regionEnd - start - len));
+                          std::vector<uint8_t> data;
+                          if (!client.getMemory(start, len + extra, data, err)) {
+                              aborted = true;
+                              break;
+                          }
+                          if (data.size() < len + extra) {
+                              aborted = true;
+                              err = "short memory read";
+                              break;
+                          }
+                          s.trainer.scannedBytes.fetch_add(len);
+                          const uint64_t chunkEnd = static_cast<uint64_t>(start) + len;
+                          while (idx < cands.size() && cands[idx].address < chunkEnd) {
+                              const size_t o = cands[idx].address - start;
+                              if (o + tsize > data.size()) { ++idx; continue; }
+                              const uint8_t* p = data.data() + o;
+                              const uint64_t bits = readBits(p, tsize);
+                              const double num = memNumber(type, p);
+                              const double prev = cands[idx].number;
+                              const uint64_t prevBits = cands[idx].bits;
+                              bool keep = false;
+                              switch (mode) {
+                              case kNextExact: keep = bits == needleBits; break;
+                              case kNextBigger: keep = num > lo; break;
+                              case kNextSmaller: keep = num < lo; break;
+                              case kNextBetween: keep = num >= lo && num <= hi; break;
+                              case kNextIncreased: keep = num > prev; break;
+                              case kNextDecreased: keep = num < prev; break;
+                              case kNextIncreasedBy: keep = num == prev + delta; break;
+                              case kNextDecreasedBy: keep = num == prev - delta; break;
+                              case kNextChanged: keep = bits != prevBits; break;
+                              case kNextUnchanged: keep = bits == prevBits; break;
+                              }
+                              if (keep) {
+                                  if (out.size() >= cap) { truncated = true; break; }
+                                  MemCandidate c;
+                                  c.address = cands[idx].address;
+                                  c.prevBits = prevBits;
+                                  c.prevNumber = prev;
+                                  c.hasPrev = true;
+                                  c.bits = bits;
+                                  c.number = num;
+                                  c.display = memDisplay(type, p);
+                                  out.push_back(std::move(c));
+                                  s.trainer.liveMatches.fetch_add(1);
+                              }
+                              ++idx;
+                          }
+                      }
+                      client.close();
+                      if (aborted) {
+                          r.text = "Filter stopped: " + err;
+                          return r;
+                      }
+                      char msg[96]{};
+                      std::snprintf(msg, sizeof(msg), "%zu match(es)%s.", out.size(),
+                                    truncated ? " (cap reached)" : "");
+                      r.text = msg;
+                      r.candidates = std::move(out);
+                      r.hasCandidates = true;
+                      return r;
+                  });
+}
+
+// One-shot writes of a batch of addresses on a single connection.
+void trainerSubmitWrite(UiState& s, const std::string& ip, const std::string& jobId,
+                        std::vector<std::pair<uint32_t, std::vector<uint8_t>>> writes) {
+    s.jobs.submit(jobId, [&s, ip, jobId, writes = std::move(writes)]() mutable {
+        JobResult r;
+        r.id = jobId;
+        XbdmClient client;
+        std::string err;
+        if (!client.connect(ip, 730, err)) {
+            r.text = "Write failed: " + err;
+            return r;
+        }
+        int ok = 0;
+        for (auto& w : writes) {
+            std::string e;
+            if (client.setMemory(w.first, w.second, e)) ++ok;
+        }
+        client.close();
+        char msg[96]{};
+        std::snprintf(msg, sizeof(msg), "Wrote %d of %zu address(es).", ok, writes.size());
+        r.text = msg;
+        return r;
+    });
+}
+
+void trainerPokeSelected(UiState& s, const std::string& ip) {
+    const std::vector<size_t> chosen = trainerChosen(s.trainer);
+    if (chosen.empty()) {
+        s.trainer.error = "Tick one or more results, or click a row, then Poke.";
+        return;
+    }
+    std::vector<uint8_t> bytes;
+    double number = 0.0;
+    const std::string text = s.trainer.writeValue[0] ? s.trainer.writeValue : s.trainer.value;
+    if (!parseScanValue(s.trainer.valueType, text, bytes, number)) {
+        s.trainer.error = "Enter a value to write.";
+        return;
+    }
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> writes;
+    writes.reserve(chosen.size());
+    for (size_t i : chosen) writes.emplace_back(s.trainer.candidates[i].address, bytes);
+    s.trainer.status = "Writing...";
+    s.trainer.error.clear();
+    trainerSubmitWrite(s, ip, "trainer_write", std::move(writes));
+}
+
+void trainerAddSelectedToPins(UiState& s) {
+    const std::vector<size_t> chosen = trainerChosen(s.trainer);
+    if (chosen.empty()) {
+        s.trainer.error = "Tick one or more results, or click a row, then add them.";
+        return;
+    }
+    int added = 0;
+    for (size_t i : chosen) {
+        const MemCandidate& c = s.trainer.candidates[i];
+        bool exists = false;
+        for (const auto& p : s.trainer.pins)
+            if (p.address == c.address) { exists = true; break; }
+        if (exists) continue;
+        PinnedEntry p;
+        p.address = c.address;
+        p.type = s.trainer.valueType;
+        p.bits = c.bits;
+        p.number = c.number;
+        p.valueText = c.display;
+        p.bytes = bytesFromBits(c.bits, p.type);
+        p.freeze = false;
+        std::snprintf(p.edit, sizeof(p.edit), "%s", c.display.c_str());
+        s.trainer.pins.push_back(std::move(p));
+        ++added;
+    }
+    if (added == 0) s.trainer.pinStatus = "Those address(es) are already listed.";
+    else s.trainer.pinStatus = "Added " + std::to_string(added) + " address(es) to the list.";
+    s.trainer.error.clear();
+}
+
+void trainerPinAddManual(UiState& s) {
+    uint32_t addr = 0;
+    if (!parseHexU32(s.trainer.pinAddr, addr)) {
+        s.trainer.pinStatus = "Enter a hex address to add.";
+        return;
+    }
+    std::vector<uint8_t> bytes;
+    double number = 0.0;
+    if (!parseScanValue(s.trainer.valueType, s.trainer.value, bytes, number)) {
+        s.trainer.pinStatus = "Enter a value for the new address.";
+        return;
+    }
+    PinnedEntry p;
+    p.address = addr;
+    p.type = s.trainer.valueType;
+    p.bits = readBits(bytes.data(), bytes.size());
+    p.number = number;
+    p.valueText = memDisplay(p.type, bytes.data());
+    p.bytes = bytes;
+    p.freeze = false;
+    std::snprintf(p.edit, sizeof(p.edit), "%s", p.valueText.c_str());
+    s.trainer.pins.push_back(std::move(p));
+    s.trainer.pinStatus = "Added 0x" + hex8(addr) + ".";
+}
+
+void trainerPinRemove(UiState& s, size_t index) {
+    if (index >= s.trainer.pins.size()) return;
+    s.trainer.pins.erase(s.trainer.pins.begin() + static_cast<long>(index));
+    s.trainer.freezeDirty = true;
+}
+
+void trainerPinPoke(UiState& s, const std::string& ip, size_t index) {
+    if (index >= s.trainer.pins.size()) return;
+    const PinnedEntry& p = s.trainer.pins[index];
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> writes;
+    writes.emplace_back(p.address, p.bytes);
+    s.trainer.status = "Writing...";
+    s.trainer.error.clear();
+    trainerSubmitWrite(s, ip, "trainer_write", std::move(writes));
+}
+
+std::filesystem::path trainerPinsPath() {
+    char buffer[MAX_PATH]{};
+    ::GetModuleFileNameA(nullptr, buffer, MAX_PATH);
+    return std::filesystem::path(buffer).parent_path() / "trainer_pins.txt";
+}
+
+void trainerSavePins(UiState& s) {
+    std::ofstream out(trainerPinsPath());
+    if (!out) {
+        s.trainer.pinStatus = "Could not write trainer_pins.txt.";
+        return;
+    }
+    out << "# X360 Toolkit trainer address list\n";
+    out << "# address type value freeze\n";
+    for (const auto& p : s.trainer.pins) {
+        out << hex8(p.address) << " " << p.type << " " << p.valueText << " " << (p.freeze ? 1 : 0)
+            << "\n";
+    }
+    s.trainer.pinStatus = "Saved " + std::to_string(s.trainer.pins.size()) + " address(es).";
+}
+
+void loadTrainerPins(UiState& s) {
+    std::ifstream in(trainerPinsPath());
+    if (!in) return;
+    s.trainer.pins.clear();
+    std::string line;
+    int loaded = 0;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string addrText, valueText;
+        int type = 2;
+        int freeze = 0;
+        if (!(ss >> addrText >> type >> valueText >> freeze)) continue;
+        uint32_t addr = 0;
+        if (!parseHexU32(addrText.c_str(), addr)) continue;
+        if (type < 0 || type >= IM_ARRAYSIZE(kMemTypeNames)) type = 2;
+        std::vector<uint8_t> bytes;
+        double number = 0.0;
+        if (!parseScanValue(type, valueText, bytes, number)) continue;
+        PinnedEntry p;
+        p.address = addr;
+        p.type = type;
+        p.bits = readBits(bytes.data(), bytes.size());
+        p.number = number;
+        p.valueText = memDisplay(type, bytes.data());
+        p.bytes = bytes;
+        p.freeze = freeze != 0;
+        std::snprintf(p.edit, sizeof(p.edit), "%s", p.valueText.c_str());
+        s.trainer.pins.push_back(std::move(p));
+        ++loaded;
+    }
+    if (loaded > 0) s.trainer.pinStatus = "Loaded " + std::to_string(loaded) + " address(es).";
+    s.trainer.freezeDirty = true;
+}
+
+// Pushes the frozen subset of the address list to the freeze worker.
+void trainerRebuildFreeze(UiState& s, const std::string& ip) {
+    std::vector<FreezeTarget> list;
+    for (const auto& p : s.trainer.pins)
+        if (p.freeze) list.push_back({p.address, p.bytes});
+    s.trainer.freeze.setTargets(ip, std::move(list));
+    s.trainer.freezeDirty = false;
+    s.trainer.freezeIp = ip;
+}
+
+// Reads a page of memory for the hex viewer.
+void trainerView(UiState& s, const std::string& ip, uint32_t base) {
+    s.trainer.viewerBase = base;
+    std::snprintf(s.trainer.viewerAddr, sizeof(s.trainer.viewerAddr), "%08X", base);
+    s.trainer.viewerReading = true;
+    s.trainer.viewerStatus = "Reading...";
+    s.jobs.submit("trainer_mem", [&s, ip, base] {
+        JobResult r;
+        r.id = "trainer_mem";
+        XbdmClient client;
+        std::string err;
+        if (!client.connect(ip, 730, err)) {
+            r.text = "Trainer: " + err;
+            return r;
+        }
+        static const uint32_t sizes[] = {0x200, 0x100, 0x80, 0x40, 0x20, 0x10};
+        std::vector<uint8_t> data;
+        std::string lastErr = "read failed";
+        for (uint32_t want : sizes) {
+            if (client.getMemory(base, want, data, lastErr)) break;
+            data.clear();
+        }
+        client.close();
+        if (data.empty()) {
+            r.text = "Read failed: " + lastErr;
+            return r;
+        }
+        r.memBytes = std::move(data);
+        r.memBase = base;
+        r.hasMem = true;
+        return r;
+    });
+}
+
+void drawTrainerFooter(UiState& s) {
+    if (!s.trainer.error.empty()) ImGui::TextWrapped("%s", s.trainer.error.c_str());
+    else ImGui::TextDisabled("%s", s.trainer.status.c_str());
+}
+
+// ----- Scanner sub-tab -----
+void drawTrainerScanner(UiState& s, const std::string& ip) {
+    auto& tr = s.trainer;
+
+    if (ImGui::Button("Refresh target", ImVec2(120, 0))) trainerRefreshTarget(s, ip);
+    ImGui::SameLine();
+    ImGui::TextDisabled("Target: %s", tr.target.empty() ? "(none)" : tr.target.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("| %zu module(s), %zu region(s)", tr.modules.size(), tr.regions.size());
+
+    ImGui::SetNextItemWidth(104.0f);
+    ImGui::InputText("Start##scan", tr.startHex, sizeof(tr.startHex));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(104.0f);
+    ImGui::InputText("Length##scan", tr.lengthHex, sizeof(tr.lengthHex));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(96.0f);
+    ImGui::Combo("Type##scan", &tr.valueType, kMemTypeNames, IM_ARRAYSIZE(kMemTypeNames));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::InputText("Value##scan", tr.value, sizeof(tr.value));
+    if (tr.firstMode == kFirstBetween) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("max");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        ImGui::InputText("##value2", tr.value2, sizeof(tr.value2));
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(240.0f);
+    static int moduleIndex = -1;
+    const std::string preview = (moduleIndex >= 0 && static_cast<size_t>(moduleIndex) < tr.modules.size())
+                                    ? tr.modules[static_cast<size_t>(moduleIndex)].name
+                                    : "Use module range...";
+    if (ImGui::BeginCombo("##module", preview.c_str())) {
+        for (size_t i = 0; i < tr.modules.size(); ++i) {
+            const auto& m = tr.modules[i];
+            char label[160]{};
+            std::snprintf(label, sizeof(label), "%s  (0x%08X + 0x%X)", m.name.c_str(), m.base, m.size);
+            if (ImGui::Selectable(label, moduleIndex == static_cast<int>(i))) {
+                moduleIndex = static_cast<int>(i);
+                std::snprintf(tr.startHex, sizeof(tr.startHex), "%08X", m.base);
+                std::snprintf(tr.lengthHex, sizeof(tr.lengthHex), "%X", m.size);
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::BeginDisabled(tr.scanning);
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::Combo("##firstmode", &tr.firstMode, kScanFirstNames, IM_ARRAYSIZE(kScanFirstNames));
+    ImGui::SameLine();
+    if (ImGui::Button("First scan", ImVec2(90, 0))) trainerFirstScan(s, ip, tr.firstMode);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (tr.scanning) ImGui::TextDisabled("%d match(es) so far", tr.liveMatches.load());
+    else ImGui::TextDisabled("%zu match(es)", tr.candidates.size());
+
+    ImGui::BeginDisabled(!tr.hasScan || tr.candidates.empty() || tr.scanning);
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::Combo("Next##next", &tr.nextType, kScanNextNames, IM_ARRAYSIZE(kScanNextNames));
+    ImGui::SameLine();
+    if (tr.nextType == kNextIncreasedBy || tr.nextType == kNextDecreasedBy) {
+        ImGui::SetNextItemWidth(70.0f);
+        ImGui::InputText("Step", tr.delta, sizeof(tr.delta));
+        ImGui::SameLine();
+    }
+    if (ImGui::Button("Next scan", ImVec2(100, 0))) trainerNextScan(s, ip);
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(tr.candidates.empty());
+    if (ImGui::Button("Select all", ImVec2(84, 0)))
+        for (auto& c : tr.candidates) c.selected = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Select none", ImVec2(90, 0)))
+        for (auto& c : tr.candidates) c.selected = false;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::InputTextWithHint("##write", "value to poke", tr.writeValue, sizeof(tr.writeValue));
+    ImGui::SameLine();
+    ImGui::BeginDisabled(tr.candidates.empty());
+    if (ImGui::Button("Poke", ImVec2(70, 0))) trainerPokeSelected(s, ip);
+    ImGui::SameLine();
+    if (ImGui::Button("Add to list", ImVec2(96, 0))) trainerAddSelectedToPins(s);
+    ImGui::EndDisabled();
+
+    if (tr.scanning) {
+        const uint32_t total = tr.totalBytes.load();
+        const uint32_t done = tr.scannedBytes.load();
+        const float frac = total ? std::min(1.0f, static_cast<float>(done) / static_cast<float>(total)) : 0.0f;
+        ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f));
+    }
+
+    const float lineH = ImGui::GetTextLineHeight();
+    const float itemSp = ImGui::GetStyle().ItemSpacing.y;
+    const float progressH = tr.scanning ? ImGui::GetFrameHeight() + itemSp : 0.0f;
+    const float tableH = std::max(80.0f, ImGui::GetContentRegionAvail().y - lineH - itemSp * 2.0f - 6.0f - progressH);
+
+    ImGui::BeginChild("##trainer_results", ImVec2(0, tableH), true, 0);
+    if (ImGui::BeginTable("##trainer_table", 4,
+                          ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("##sel", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Previous", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(tr.candidates.size()));
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                auto& c = tr.candidates[static_cast<size_t>(row)];
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::PushID(row);
+                ImGui::Checkbox("##sel", &c.selected);
+                ImGui::PopID();
+                ImGui::TableNextColumn();
+                if (ImGui::Selectable(hex8(c.address).c_str(), tr.selected == row)) {
+                    tr.selected = row;
+                }
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(c.display.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(c.hasPrev ? displayFromBits(tr.valueType, c.prevBits).c_str() : "-");
+            }
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+
+    drawTrainerFooter(s);
+}
+
+// ----- Address list sub-tab -----
+void drawTrainerPins(UiState& s, const std::string& ip) {
+    auto& tr = s.trainer;
+
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::InputTextWithHint("##pin_addr", "address", tr.pinAddr, sizeof(tr.pinAddr));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(96.0f);
+    ImGui::Combo("##pin_type", &tr.valueType, kMemTypeNames, IM_ARRAYSIZE(kMemTypeNames));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::InputTextWithHint("##pin_value", "value", tr.value, sizeof(tr.value));
+    ImGui::SameLine();
+    if (ImGui::Button("Add", ImVec2(60, 0))) trainerPinAddManual(s);
+    ImGui::SameLine();
+    if (ImGui::Button("Save##pins", ImVec2(70, 0))) trainerSavePins(s);
+    ImGui::SameLine();
+    if (ImGui::Button("Load##pins", ImVec2(70, 0))) loadTrainerPins(s);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%zu address(es) | %zu frozen", tr.pins.size(), tr.freeze.count());
+
+    const float lineH = ImGui::GetTextLineHeight();
+    const float itemSp = ImGui::GetStyle().ItemSpacing.y;
+    const float tableH = std::max(80.0f, ImGui::GetContentRegionAvail().y - lineH - itemSp * 2.0f - 24.0f);
+
+    ImGui::BeginChild("##pin_list", ImVec2(0, tableH), true, 0);
+    int removeIndex = -1;
+    int pokeIndex = -1;
+    if (ImGui::BeginTable("##pin_table", 5,
+                          ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Freeze", ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGui::TableHeadersRow();
+
+        for (size_t i = 0; i < tr.pins.size(); ++i) {
+            auto& p = tr.pins[i];
+            ImGui::TableNextRow();
+            ImGui::PushID(static_cast<int>(i));
+
+            ImGui::TableNextColumn();
+            if (ImGui::Checkbox("##freeze", &p.freeze)) tr.freezeDirty = true;
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(hex8(p.address).c_str());
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(kMemTypeNames[p.type]);
+
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputText("##val", p.edit, sizeof(p.edit));
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                std::vector<uint8_t> bytes;
+                double number = 0.0;
+                if (parseScanValue(p.type, p.edit, bytes, number)) {
+                    p.bytes = bytes;
+                    p.bits = readBits(bytes.data(), bytes.size());
+                    p.number = number;
+                    p.valueText = p.edit;
+                    tr.freezeDirty = true;
+                }
+            }
+
+            ImGui::TableNextColumn();
+            if (ImGui::Button("Poke")) pokeIndex = static_cast<int>(i);
+            ImGui::SameLine();
+            if (ImGui::Button("Remove")) removeIndex = static_cast<int>(i);
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+
+    if (pokeIndex >= 0) trainerPinPoke(s, ip, static_cast<size_t>(pokeIndex));
+    if (removeIndex >= 0) trainerPinRemove(s, static_cast<size_t>(removeIndex));
+
+    if (!tr.pinStatus.empty()) ImGui::TextDisabled("%s", tr.pinStatus.c_str());
+    else drawTrainerFooter(s);
+}
+
+// ----- Memory viewer sub-tab -----
+void drawTrainerViewer(UiState& s, const std::string& ip) {
+    auto& tr = s.trainer;
+
+    if (!tr.viewerLoaded && !tr.viewerReading && !tr.viewerTried) {
+        tr.viewerTried = true;
+        uint32_t base = tr.viewerBase;
+        parseHexU32(tr.viewerAddr, base);
+        trainerView(s, ip, base);
+    }
+
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::InputText("Address##view", tr.viewerAddr, sizeof(tr.viewerAddr));
+    ImGui::SameLine();
+    if (ImGui::Button("Go", ImVec2(50, 0))) {
+        uint32_t base = 0;
+        if (parseHexU32(tr.viewerAddr, base)) trainerView(s, ip, base);
+        else tr.viewerStatus = "Enter a hex address.";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Prev", ImVec2(60, 0))) trainerView(s, ip, tr.viewerBase - 0x100);
+    ImGui::SameLine();
+    if (ImGui::Button("Next", ImVec2(60, 0))) trainerView(s, ip, tr.viewerBase + 0x100);
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh", ImVec2(80, 0))) trainerView(s, ip, tr.viewerBase);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", tr.viewerStatus.c_str());
+
+    const float lineH = ImGui::GetTextLineHeight();
+    const float itemSp = ImGui::GetStyle().ItemSpacing.y;
+    const float hexH = std::max(120.0f, ImGui::GetContentRegionAvail().y - lineH * 3.0f - itemSp * 5.0f - 40.0f);
+
+    ImGui::BeginChild("##hex", ImVec2(0, hexH), true, 0);
+    if (tr.viewerBytes.empty()) {
+        ImGui::TextDisabled("No data.");
+    } else {
+        const int cols = 16;
+        const int rows = static_cast<int>((tr.viewerBytes.size() + cols - 1) / cols);
+        for (int r = 0; r < rows; ++r) {
+            const uint32_t rowAddr = tr.viewerBase + static_cast<uint32_t>(r * cols);
+            ImGui::Text("%08X", rowAddr);
+            for (int c = 0; c < cols; ++c) {
+                const size_t idx = static_cast<size_t>(r * cols + c);
+                ImGui::SameLine();
+                ImGui::PushID(static_cast<int>(idx));
+                if (idx < tr.viewerBytes.size()) {
+                    char b[4]{};
+                    std::snprintf(b, sizeof(b), "%02X", tr.viewerBytes[idx]);
+                    if (ImGui::Selectable(b, tr.viewerSelected == static_cast<int>(idx), 0,
+                                          ImVec2(24.0f, 0.0f))) {
+                        tr.viewerSelected = static_cast<int>(idx);
+                        std::snprintf(tr.viewerWriteAddr, sizeof(tr.viewerWriteAddr), "%08X",
+                                      rowAddr + static_cast<uint32_t>(c));
+                    }
+                } else {
+                    ImGui::TextDisabled("  ");
+                }
+                ImGui::PopID();
+            }
+            ImGui::SameLine();
+            std::string ascii;
+            for (int c = 0; c < cols; ++c) {
+                const size_t idx = static_cast<size_t>(r * cols + c);
+                if (idx >= tr.viewerBytes.size()) break;
+                const uint8_t b = tr.viewerBytes[idx];
+                ascii.push_back((b >= 32 && b < 127) ? static_cast<char>(b) : '.');
+            }
+            ImGui::TextDisabled("%s", ascii.c_str());
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::InputTextWithHint("##waddr", "write address", tr.viewerWriteAddr, sizeof(tr.viewerWriteAddr));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::InputTextWithHint("##whex", "hex bytes (e.g. 63 00 00 00)", tr.viewerWriteHex,
+                             sizeof(tr.viewerWriteHex));
+    ImGui::SameLine();
+    if (ImGui::Button("Write", ImVec2(70, 0))) {
+        uint32_t addr = 0;
+        std::vector<uint8_t> bytes;
+        if (!parseHexU32(tr.viewerWriteAddr, addr)) {
+            tr.viewerStatus = "Enter a hex write address.";
+        } else if (!parseHexBytes(tr.viewerWriteHex, bytes)) {
+            tr.viewerStatus = "Enter hex bytes, for example 63 00 00 00.";
+        } else {
+            tr.viewerStatus = "Writing...";
+            trainerSubmitWrite(s, ip, "trainer_vwrite", {{addr, bytes}});
+        }
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(tr.viewerSelected < 0 ||
+                         static_cast<size_t>(tr.viewerSelected) + 4 > tr.viewerBytes.size());
+    if (ImGui::Button("Follow dword", ImVec2(110, 0))) {
+        const size_t idx = static_cast<size_t>(tr.viewerSelected);
+        const uint32_t target = static_cast<uint32_t>(tr.viewerBytes[idx]) |
+                                (static_cast<uint32_t>(tr.viewerBytes[idx + 1]) << 8) |
+                                (static_cast<uint32_t>(tr.viewerBytes[idx + 2]) << 16) |
+                                (static_cast<uint32_t>(tr.viewerBytes[idx + 3]) << 24);
+        trainerView(s, ip, target);
+    }
+    ImGui::EndDisabled();
+
+    if (!tr.viewerStatus.empty()) ImGui::TextDisabled("%s", tr.viewerStatus.c_str());
+}
+
+void drawTrainerTab(UiState& s, const std::string& ip) {
+    auto& tr = s.trainer;
+
+    // On first open, read the target's module and memory map so scans know which
+    // ranges are actually mapped.
+    if (!tr.refreshed && tr.regions.empty() && !tr.scanning) {
+        tr.refreshed = true;
+        trainerRefreshTarget(s, ip);
+    }
+    if (tr.freezeDirty && !ip.empty()) trainerRebuildFreeze(s, ip);
+    else if (!ip.empty() && tr.freezeIp != ip) trainerRebuildFreeze(s, ip);
+
+    if (ImGui::BeginTabBar("##trainer_sub")) {
+        if (ImGui::BeginTabItem("Scanner")) {
+            tr.subTab = 0;
+            drawTrainerScanner(s, ip);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Address list")) {
+            tr.subTab = 1;
+            drawTrainerPins(s, ip);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Memory viewer")) {
+            tr.subTab = 2;
+            drawTrainerViewer(s, ip);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
 void drawConsoleScreen(UiState& s, float height) {
     if (s.selected < 0 || static_cast<size_t>(s.selected) >= s.consoles.size()) {
         s.screen = Screen::Home;
@@ -1490,6 +2833,10 @@ void drawConsoleScreen(UiState& s, float height) {
         }
         if (ImGui::BeginTabItem("File Explorer")) {
             drawExplorerTab(s, console.ip);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Trainer")) {
+            drawTrainerTab(s, console.ip);
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -1569,6 +2916,21 @@ void drawHelpWindow(UiState& s) {
     ImGui::BulletText("Back, Up, Refresh and breadcrumb buttons navigate instantly from the cache");
     ImGui::BulletText("Icons / Details switches between thumbnail grid and sortable table");
 
+    sectionTitle("TRAINER TAB");
+    ImGui::BulletText("Refresh target - reads XBEINFO RUNNING, MODULES and WALKMEM");
+    ImGui::BulletText("Scanner: set a start address + length (hex) and a value type");
+    ImGui::BulletText("First scan: Exact, Unknown, Bigger, Smaller or Between");
+    ImGui::BulletText("Unknown snapshots everything (use it when a value is a bar, not a number)");
+    ImGui::BulletText("Only mapped memory inside the window is read, in 256 KB chunks");
+    ImGui::BulletText("Next scan: Exact, Bigger, Smaller, Between, Increased, Decreased,");
+    ImGui::BulletText("           Increased by, Decreased by, Changed and Unchanged");
+    ImGui::BulletText("For a health bar: Unknown, take damage, then Next scan -> Decreased");
+    ImGui::BulletText("Tick results (or click one) and Poke to write the value once, never automatically");
+    ImGui::BulletText("Add selected puts results in the Address list, which can save/load and freeze");
+    ImGui::BulletText("Address list: tick Freeze to re-write that address every half second");
+    ImGui::BulletText("Memory viewer: Go to an address, click a byte, write hex bytes or follow a dword");
+    ImGui::BulletText("Writing to a running title can crash it - poke only addresses you understand");
+
     sectionTitle("RAW XBDM COMMANDS");
     ImGui::BulletText("SYSTEMINFO - console type, platform, kernel versions");
     ImGui::BulletText("DRIVELIST - list mounted drives");
@@ -1580,6 +2942,10 @@ void drawHelpWindow(UiState& s) {
     ImGui::BulletText("DELETE NAME=\"Hdd1:\\file.bin\" - delete a file");
     ImGui::BulletText("DELETE NAME=\"Hdd1:\\folder\" DIR - delete an empty folder");
     ImGui::BulletText("XBEINFO RUNNING - currently running title");
+    ImGui::BulletText("MODULES - loaded modules with base address and size");
+    ImGui::BulletText("WALKMEM - mapped virtual address ranges");
+    ImGui::BulletText("GETMEMEX ADDR=0x<addr> LENGTH=0x<len> - read memory (binary)");
+    ImGui::BulletText("SETMEM ADDR=0x<addr> DATA=<hex> - write up to 128 bytes");
     ImGui::BulletText("REBOOT - reboot the console");
 
     sectionTitle("OFFLINE TOOLS");
@@ -1608,6 +2974,11 @@ void drawUi(UiState& s) {
             }
         }
     }
+
+    const std::string currentIp =
+        (s.selected >= 0 && static_cast<size_t>(s.selected) < s.consoles.size())
+            ? s.consoles[static_cast<size_t>(s.selected)].ip
+            : std::string();
 
     for (auto& result : s.jobs.poll()) {
         if (result.id == "info") s.infoText = result.text;
@@ -1646,6 +3017,59 @@ void drawUi(UiState& s) {
             }
         } else if (result.id == "screenshot") {
             s.logText = result.text;
+        } else if (result.id == "trainer_refresh") {
+            if (!result.text.empty()) {
+                s.trainer.error = result.text;
+                s.trainer.status.clear();
+            } else {
+                s.trainer.target = result.path;
+                s.trainer.modules = std::move(result.modules);
+                s.trainer.regions = std::move(result.regions);
+                s.trainer.error.clear();
+                s.trainer.status = "Read " + std::to_string(s.trainer.modules.size()) + " module(s) and " +
+                                   std::to_string(s.trainer.regions.size()) + " memory region(s).";
+            }
+        } else if (result.id == "trainer_scan" || result.id == "trainer_narrow") {
+            s.trainer.scanning = false;
+            if (result.hasCandidates) {
+                s.trainer.candidates = std::move(result.candidates);
+                s.trainer.hasScan = true;
+                s.trainer.selected = -1;
+                s.trainer.error.clear();
+                s.trainer.status = result.text;
+            } else {
+                s.trainer.status.clear();
+                s.trainer.error = result.text;
+            }
+        } else if (result.id == "trainer_write") {
+            s.trainer.error.clear();
+            s.trainer.status = result.text;
+            if (result.text.rfind("Write failed", 0) == 0) s.trainer.error = result.text;
+        } else if (result.id == "trainer_vwrite") {
+            if (result.text.rfind("Write failed", 0) == 0) {
+                s.trainer.viewerStatus = result.text;
+            } else {
+                s.trainer.viewerStatus = result.text;
+                const std::string ip =
+                    (s.selected >= 0 && static_cast<size_t>(s.selected) < s.consoles.size())
+                        ? s.consoles[static_cast<size_t>(s.selected)].ip
+                        : std::string();
+                if (!ip.empty()) trainerView(s, ip, s.trainer.viewerBase);
+            }
+        } else if (result.id == "trainer_mem") {
+            s.trainer.viewerReading = false;
+            if (result.hasMem) {
+                s.trainer.viewerBytes = std::move(result.memBytes);
+                s.trainer.viewerBase = result.memBase;
+                s.trainer.viewerLoaded = true;
+                s.trainer.viewerSelected = -1;
+                char msg[64]{};
+                std::snprintf(msg, sizeof(msg), "0x%08X, %zu bytes", result.memBase,
+                              s.trainer.viewerBytes.size());
+                s.trainer.viewerStatus = msg;
+            } else {
+                s.trainer.viewerStatus = result.text;
+            }
         }
     }
 
@@ -1701,6 +3125,7 @@ void drawUi(UiState& s) {
         ImGui::TextUnformatted("X360 Toolkit 0.1");
         ImGui::Separator();
         ImGui::TextUnformatted("Console control over XBDM, plus XZP, XEX and NAND tools.");
+        ImGui::TextUnformatted("Trainer: scans and edits a running title's memory over XBDM.");
         if (ImGui::Button("Close", ImVec2(100, 0))) s.showAbout = false;
         ImGui::End();
     }
@@ -1757,6 +3182,7 @@ int runGui() {
 
     UiState state;
     loadConsoles(state);
+    loadTrainerPins(state);
 
     while (!state.done) {
         MSG msg;

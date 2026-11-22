@@ -12,7 +12,7 @@ It talks to the console's XBDM debug monitor directly over TCP port 730. It does
 
 <img src="pics/pic4.png" width="720" alt="File explorer, icon view">
 
-*File explorer browsing a game library in icon view.*
+*File explorer browsing a folder in icon view.*
 
 <img src="pics/pic2.png" width="720" alt="Console tab">
 
@@ -52,6 +52,21 @@ It talks to the console's XBDM debug monitor directly over TCP port 730. It does
 - Folder delete is recursive.
 - Screenshots are saved with the GPU framebuffer correctly untiled.
 
+### Trainer
+
+A Cheat Engine style memory scanner and editor for the running title, over XBDM. It has three sub-tabs: **Scanner**, **Address list** and **Memory viewer**.
+
+- **Refresh target** reads the running executable name with `XBEINFO RUNNING`, the loaded modules with `MODULES`, and the mapped address ranges with `WALKMEM`.
+- **Scanner**: pick a start address and length (or choose one from the module list), a value type and a value, then **First scan**.
+  - First-scan types are **Exact**, **Unknown**, **Bigger**, **Smaller** and **Between**.
+  - **Unknown** snapshots every value in the range, which is the way to find a value that is a bar rather than a number (health, stamina).
+- **Next scan** re-reads the surviving addresses and filters them by **Exact**, **Bigger**, **Smaller**, **Between**, **Increased**, **Decreased**, **Increased by**, **Decreased by**, **Changed** or **Unchanged**. Each run is compared against the value captured by the previous run, and the results table shows the current value and the previous value side by side.
+- Only mapped memory inside the window is read, in 256 KB chunks, so `GETMEMEX` is never asked for unmapped pages. A next scan only reads windows that still contain candidates, so it gets faster as the list narrows.
+- Tick results (or click one) and **Poke** to write a value once, or **Add to list** to move them to the address list.
+- **Address list**: a persistent list of addresses with their type and value. Tick **Freeze** to re-write that value about twice a second, edit a value in place, or **Poke** it once. The list is saved to `trainer_pins.txt` next to the executable.
+- **Memory viewer**: a hex view of a page of memory. Go to an address, click a byte to select it, write space-separated hex bytes, or follow the dword under the cursor as an address.
+- The trainer only reads memory. Nothing is written unless you press Poke, Write or tick Freeze. Writing to a running title can crash it, so only poke addresses you understand.
+
 ### Offline tools
 
 - **XUIZ / XZP**: inspect skin packages, list entries, extract files, carve images.
@@ -62,8 +77,8 @@ It talks to the console's XBDM debug monitor directly over TCP port 730. It does
 
 C++20 and Win32, with Dear ImGui (v1.93.1) rendered through DirectX 11. The result is a single window and a single executable with no console window.
 
-- `src/core/XbdmClient.*` implements the XBDM text protocol directly over Winsock: `DIRLIST`, `GETFILE`, `SENDFILE`, `MKDIR`, `RENAME`, `DELETE`, `SCREENSHOT`, `SYSTEMINFO`, and `DRIVELIST`.
-- `src/ui/GuiApp.cpp` contains the UI, the file explorer, and the job runner.
+- `src/core/XbdmClient.*` implements the XBDM text protocol directly over Winsock: `DIRLIST`, `GETFILE`, `SENDFILE`, `MKDIR`, `RENAME`, `DELETE`, `SCREENSHOT`, `SYSTEMINFO`, `DRIVELIST`, `XBEINFO RUNNING`, `MODULES`, `WALKMEM`, `GETMEMEX`, and `SETMEM`.
+- `src/ui/GuiApp.cpp` contains the UI, the file explorer, the memory trainer and memory viewer, and the job runner.
 - `src/modules/*` contains the offline tools, registered through a small `ITool` / `Registry` interface in `src/core/Tool.h`.
 - Console work runs on a background job queue with four worker threads, so the UI never blocks on the network.
 - Each transfer opens its own connection and writes to its own path, so switching directories during a transfer cannot corrupt it.
@@ -109,6 +124,7 @@ x64\Release\xthree6ty.exe
 - This XBDM build answers `SYSTEMINFO`; `CONSOLEINFO` is not available on it.
 - Files are deleted with `DELETE NAME="<path>"`; empty folders are removed with `DELETE NAME="<path>" DIR`. Folder deletion removes the contents first.
 - The saved console list is stored in `consoles.ini` next to the executable.
+- The trainer address list is stored in `trainer_pins.txt` next to the executable.
 - The app is GUI only. There is no command-line mode.
 
 ## License

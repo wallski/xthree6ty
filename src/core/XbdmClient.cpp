@@ -653,4 +653,159 @@ bool XbdmClient::screenshot(const std::string& localPng, std::string& error,
     return ok;
 }
 
+bool XbdmClient::readFilePrefix(const std::string& remote, size_t maxBytes,
+                                std::vector<uint8_t>& out, std::string& error) {
+    out.clear();
+    const std::string wire = "GETFILE NAME=\"" + remote + "\"\r\n";
+    if (!impl_->sendAll(wire.data(), wire.size(), error)) return false;
+
+    std::string line;
+    bool binary = false;
+    for (int i = 0; i < 32; ++i) {
+        if (!impl_->nextLine(line, error, 5)) return false;
+        if (line.rfind("203-", 0) == 0) { binary = true; break; }
+        if (!line.empty() && line[0] == '4') {
+            error = "console rejected GETFILE: " + line;
+            return false;
+        }
+    }
+    if (!binary) {
+        error = "no binary response from GETFILE";
+        return false;
+    }
+
+    uint8_t sizeBytes[4]{};
+    if (!impl_->recvExact(sizeBytes, 4, error)) return false;
+    const uint64_t size = static_cast<uint64_t>(sizeBytes[0]) |
+                          (static_cast<uint64_t>(sizeBytes[1]) << 8) |
+                          (static_cast<uint64_t>(sizeBytes[2]) << 16) |
+                          (static_cast<uint64_t>(sizeBytes[3]) << 24);
+    const size_t want = static_cast<size_t>(std::min<uint64_t>(size, maxBytes));
+    out.assign(want, 0);
+    if (want != 0 && !impl_->recvExact(out.data(), out.size(), error)) {
+        impl_->close();
+        return false;
+    }
+    // GETFILE has no range support on this XBDM build, so the console is still
+    // pushing the rest of the file. Close the connection to stop it; this
+    // client is not usable for further commands after a prefix read.
+    impl_->close();
+    return true;
+}
+
+bool XbdmClient::getMemory(uint32_t address, uint32_t length, std::vector<uint8_t>& out,
+                           std::string& error) {
+    out.clear();
+    if (length == 0) return true;
+
+    char cmd[96]{};
+    std::snprintf(cmd, sizeof(cmd), "GETMEMEX ADDR=0x%08X LENGTH=0x%08X\r\n", address, length);
+    if (!impl_->sendAll(cmd, std::strlen(cmd), error)) return false;
+
+    std::string line;
+    bool binary = false;
+    for (int i = 0; i < 16; ++i) {
+        if (!impl_->nextLine(line, error, 5)) return false;
+        if (line.rfind("203-", 0) == 0) { binary = true; break; }
+        if (!line.empty() && line[0] == '4') {
+            error = line;
+            return false;
+        }
+    }
+    if (!binary) {
+        error = "no binary response from GETMEMEX";
+        return false;
+    }
+
+    // GETMEMEX sends a 2-byte flag pair before each 0x400-byte page.
+    out.reserve(length);
+    uint32_t remaining = length;
+    uint8_t flag[2]{};
+    uint8_t buf[0x400]{};
+    while (remaining >= 0x400u) {
+        if (!impl_->recvExact(flag, 2, error)) return false;
+        if (!impl_->recvExact(buf, 0x400, error)) return false;
+        out.insert(out.end(), buf, buf + 0x400);
+        remaining -= 0x400u;
+    }
+    if (remaining > 0) {
+        if (!impl_->recvExact(flag, 2, error)) return false;
+        if (!impl_->recvExact(buf, remaining, error)) return false;
+        out.insert(out.end(), buf, buf + remaining);
+    }
+    return true;
+}
+
+bool XbdmClient::setMemory(uint32_t address, const std::vector<uint8_t>& data,
+                           std::string& error) {
+    static const char* kDigits = "0123456789ABCDEF";
+    size_t offset = 0;
+    while (offset < data.size()) {
+        // The console only accepts 128 bytes of hex payload per SETMEM.
+        const size_t chunk = std::min<size_t>(128, data.size() - offset);
+        char addrText[16]{};
+        std::snprintf(addrText, sizeof(addrText), "%08X",
+                      static_cast<unsigned>(address + offset));
+        std::string cmd = "SETMEM ADDR=0x";
+        cmd += addrText;
+        cmd += " DATA=";
+        cmd.reserve(cmd.size() + chunk * 2);
+        for (size_t i = 0; i < chunk; ++i) {
+            const uint8_t b = data[offset + i];
+            cmd.push_back(kDigits[b >> 4]);
+            cmd.push_back(kDigits[b & 0x0f]);
+        }
+
+        const auto lines = command(cmd, error);
+        if (!error.empty()) return false;
+        bool ok = false;
+        for (const auto& l : lines) {
+            if (l.rfind("200", 0) == 0) { ok = true; break; }
+            if (!l.empty() && l[0] == '4') {
+                error = "console rejected SETMEM: " + l;
+                return false;
+            }
+        }
+        if (!ok) {
+            error = "no confirmation from SETMEM";
+            return false;
+        }
+        offset += chunk;
+    }
+    return true;
+}
+
+bool XbdmClient::listModules(std::vector<ModuleInfo>& out, std::string& error) {
+    const auto lines = command("MODULES", error);
+    if (!error.empty()) return false;
+    for (const auto& line : lines) {
+        const auto nameAt = line.find("name=\"");
+        if (nameAt == std::string::npos) continue;
+        const auto start = nameAt + 6;
+        const auto end = line.find('"', start);
+        if (end == std::string::npos) continue;
+        ModuleInfo m;
+        m.name = line.substr(start, end - start);
+        m.base = hex32(line, "base=");
+        m.size = hex32(line, " size=");
+        out.push_back(std::move(m));
+    }
+    return true;
+}
+
+bool XbdmClient::listMemoryRegions(std::vector<MemRegion>& out, std::string& error) {
+    const auto lines = command("WALKMEM", error);
+    if (!error.empty()) return false;
+    for (const auto& line : lines) {
+        if (line.find("base=") == std::string::npos) continue;
+        MemRegion r;
+        r.base = hex32(line, "base=");
+        r.size = hex32(line, " size=");
+        r.protect = hex32(line, "protect=");
+        if (r.size == 0) continue;
+        out.push_back(r);
+    }
+    return true;
+}
+
 } // namespace x360
